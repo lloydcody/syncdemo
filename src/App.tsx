@@ -36,10 +36,17 @@ function App() {
   const totalWidth = window.location.hash ?
     parseInt(window.location.hash.replace(/.*totalwidth=(\d+).*/, '$1'), 10) : window.innerWidth;
 
-  // Custom logging function
-  const log = (message: string) => {
-    setConsoleLogs(prev => [...prev.slice(-4), message]);
-  };
+  // Override console.log to capture logs
+  useEffect(() => {
+    const originalConsoleLog = console.log;
+    console.log = (...args) => {
+      originalConsoleLog.apply(console, args);
+      setConsoleLogs(prev => [...prev.slice(-4), args.join(' ')]);
+    };
+    return () => {
+      console.log = originalConsoleLog;
+    };
+  }, []);
 
   useEffect(() => {
     // Initialize timing object
@@ -55,17 +62,15 @@ function App() {
     peer.current = new Peer(peerId, PEERJS_CONFIG);
     
     peer.current.on('open', (id) => {
-      log(`Registered with ID: ${id}`);
+      console.log('My peer ID is: ' + id);
       peer.current?.listAllPeers((peerList) => {
         const otherPeers = peerList.filter(pid => pid.startsWith('MENUSYNC_') && pid !== peerId);
         
         if (otherPeers.length > 0) {
-          log(`Found ${otherPeers.length} peer(s), connecting...`);
           // If there are other peers, connect to the first one and sync timing
           const conn = peer.current?.connect(otherPeers[0]);
           if (conn) {
             conn.on('open', () => {
-              log(`Connected to primary peer: ${otherPeers[0]}`);
               conn.send({ type: 'sync-request' });
             });
             setupConnection(conn);
@@ -74,7 +79,6 @@ function App() {
         
         // Connect to all other peers for redundancy
         otherPeers.slice(1).forEach(peerId => {
-          log(`Connecting to backup peer: ${peerId}`);
           const conn = peer.current?.connect(peerId);
           if (conn) setupConnection(conn);
         });
@@ -82,17 +86,7 @@ function App() {
     });
 
     peer.current.on('connection', (conn) => {
-      log(`Incoming connection from: ${conn.peer}`);
       setupConnection(conn);
-    });
-
-    peer.current.on('disconnected', () => {
-      log('Disconnected from server, attempting to reconnect...');
-      peer.current?.reconnect();
-    });
-
-    peer.current.on('error', (err) => {
-      log(`Peer error: ${err.type}`);
     });
 
     // Animation update function using requestAnimationFrame
@@ -153,7 +147,6 @@ function App() {
     conn.on('open', () => {
       connections.current.add(conn);
       setPeerCount(connections.current.size);
-      log(`Connection established with: ${conn.peer}`);
       
       // Measure latency
       const start = Date.now();
@@ -175,7 +168,6 @@ function App() {
         // Update timing object with received state
         if (timingObject.current) {
           timingObject.current.update(data.state);
-          log('Synchronized timing with peer');
         }
       }
     });
@@ -183,11 +175,6 @@ function App() {
     conn.on('close', () => {
       connections.current.delete(conn);
       setPeerCount(connections.current.size);
-      log(`Peer disconnected: ${conn.peer}`);
-    });
-
-    conn.on('error', (err) => {
-      log(`Connection error with ${conn.peer}: ${err.type}`);
     });
   };
 
@@ -219,7 +206,7 @@ function App() {
           />
         </div>
         <div className="border-t border-white/20 pt-2">
-          <div className="text-sm font-medium mb-1">Log:</div>
+          <div className="text-sm font-medium mb-1">Console Logs:</div>
           <div className="space-y-1">
             {consoleLogs.map((log, index) => (
               <div key={index} className="text-sm font-mono opacity-80 truncate">
