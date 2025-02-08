@@ -1,3 +1,15 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@font-face {
+  font-family: 'National 2 Condensed';
+  src: url('https://www.kfc.com.au/static/media/National2Condensed-Bold.a091dde9.otf') format('opentype');
+  font-weight: bold;
+  font-style: normal;
+  font-display: swap;
+}
+
+body {
+  font-family: 'National 2 Condensed', system-ui, -apple-system, sans-serif;
+}
