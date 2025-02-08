@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { TimingObject } from 'timing-object';
 import Peer from 'peerjs';
-import { Clock, Signal, Users } from 'lucide-react';
+import { Clock, Signal, Users, ArrowDownLeft, ArrowUpRight } from 'lucide-react';
 
 const PEERJS_CONFIG = {
   host: "peerjs-server-t8z8.onrender.com",
@@ -12,13 +12,17 @@ const PEERJS_CONFIG = {
   secure: true,
 };
 
-const CYCLE_DURATION = 30; // seconds
+const CYCLE_DURATION = 30;
+const PEER_DISCONNECT_LINGER = 8000; // 8 seconds to show disconnected peers
 const LOREM_IPSUM = `Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.`;
 
 interface PeerLatency {
   id: string;
   latency: number;
   lastUpdate: number;
+  direction: 'incoming' | 'outgoing';
+  disconnected?: boolean;
+  disconnectTime?: number;
 }
 
 interface TimingUpdate {
@@ -97,13 +101,15 @@ function App() {
   const [peerId, setPeerId] = useState<string>('');
   const [connectionStartTime, setConnectionStartTime] = useState<number>(0);
   const [lastTimingUpdate, setLastTimingUpdate] = useState<TimingUpdate | null>(null);
+  const [allPeers, setAllPeers] = useState<string[]>([]);
   
   const timingObject = useRef<TimingObject>();
   const peer = useRef<Peer>();
-  const connections = useRef<Map<string, Peer.DataConnection>>(new Map());
+  const connections = useRef<Map<string, { conn: Peer.DataConnection; direction: 'incoming' | 'outgoing' }>>(new Map());
   const animationFrameRef = useRef<number>();
   const startTime = useRef<number>(Date.now());
   const latencyInterval = useRef<NodeJS.Timeout>();
+  const imageRef = useRef<HTMLImageElement>(null);
 
   const leftOffset = window.location.hash ? 
     parseInt(window.location.hash.replace(/.*leftoffset=(\d+).*/, '$1'), 10) : 0;
@@ -121,11 +127,29 @@ function App() {
     return match ? match[0] : null;
   };
 
+  const updatePeerCount = () => {
+    const activeConnections = peerLatencies.filter(p => !p.disconnected).length;
+    setPeerCount(activeConnections);
+  };
+
+  const logMessage = (message: string) => {
+    setConsoleLogs(prev => {
+      // Don't add if it's the same as the last message
+      if (prev.length > 0 && prev[prev.length - 1] === message) {
+        return prev;
+      }
+      return [...prev.slice(-4), message];
+    });
+  };
+
   useEffect(() => {
     const originalConsoleLog = console.log;
     console.log = (...args) => {
       originalConsoleLog.apply(console, args);
-      setConsoleLogs(prev => [...prev.slice(-5), args.join(' ')]);
+      const message = args.join(' ');
+      if (!message.includes('Received timing sync from peer')) {
+        logMessage(message);
+      }
     };
     return () => {
       console.log = originalConsoleLog;
@@ -143,7 +167,7 @@ function App() {
       timestamp: Date.now()
     };
     
-    connections.current.forEach(conn => {
+    connections.current.forEach(({ conn }) => {
       conn.send(update);
     });
   };
@@ -159,7 +183,7 @@ function App() {
     }
   };
 
-  const setupConnection = async (conn: Peer.DataConnection) => {
+  const setupConnection = async (conn: Peer.DataConnection, direction: 'incoming' | 'outgoing') => {
     const isRegistered = await checkPeerRegistration(conn.peer);
     if (!isRegistered) {
       console.log(`Closing connection to unregistered peer: ${conn.peer}`);
@@ -170,19 +194,29 @@ function App() {
     const existingConn = connections.current.get(conn.peer);
     if (existingConn) {
       console.log('Closing existing connection to: ' + conn.peer);
-      existingConn.close();
+      existingConn.conn.close();
       connections.current.delete(conn.peer);
     }
 
     conn.on('open', () => {
-      connections.current.set(conn.peer, conn);
-      setPeerCount(connections.current.size);
-      setPeerLatencies(prev => [...prev.filter(p => p.id !== conn.peer), { id: conn.peer, latency: 0, lastUpdate: Date.now() }]);
+      connections.current.set(conn.peer, { conn, direction });
+      setPeerLatencies(prev => {
+        const newLatencies = [
+          ...prev.filter(p => p.id !== conn.peer), 
+          { 
+            id: conn.peer, 
+            latency: 0, 
+            lastUpdate: Date.now(), 
+            direction,
+            disconnected: false 
+          }
+        ];
+        return newLatencies;
+      });
+      updatePeerCount();
       
       const start = Date.now();
       conn.send({ type: 'ping', time: start });
-
-      console.log('Requesting timing sync from peer: ' + conn.peer);
       conn.send({ type: 'sync-request' });
     });
 
@@ -198,7 +232,6 @@ function App() {
         ));
       } else if (data.type === 'sync-request') {
         if (timingObject.current) {
-          console.log('Sending timing sync to peer: ' + conn.peer);
           const state = timingObject.current.query();
           conn.send({ 
             type: 'sync-response',
@@ -209,17 +242,16 @@ function App() {
         }
       } else if (data.type === 'sync-response' || data.type === 'sync-broadcast') {
         if (timingObject.current) {
-          console.log(`Received timing sync from peer ${data.sourcePeerId}`);
           timingObject.current.update(data.state);
           
           setLastTimingUpdate({
             timestamp: data.timestamp,
-            peerId: data.sourcePeerId,
+            peerId: data.sourcePeerId || conn.peer,
             position: data.state.position
           });
 
           if (data.type === 'sync-response') {
-            connections.current.forEach(otherConn => {
+            connections.current.forEach(({ conn: otherConn }) => {
               if (otherConn !== conn) {
                 otherConn.send({
                   type: 'sync-broadcast',
@@ -235,9 +267,17 @@ function App() {
     });
 
     conn.on('close', () => {
+      const now = Date.now();
       connections.current.delete(conn.peer);
-      setPeerCount(connections.current.size);
-      setPeerLatencies(prev => prev.filter(p => p.id !== conn.peer));
+      setPeerLatencies(prev => {
+        const newLatencies = prev.map(p => 
+          p.id === conn.peer 
+            ? { ...p, disconnected: true, disconnectTime: now }
+            : p
+        );
+        return newLatencies;
+      });
+      updatePeerCount();
       console.log('Peer disconnected: ' + conn.peer);
     });
   };
@@ -262,24 +302,20 @@ function App() {
         peer.current?.listAllPeers((peerList) => {
           const menuSyncPeers = peerList.filter(pid => pid.startsWith('MENUSYNC_'));
           setTotalPeers(menuSyncPeers.length);
-          
-          const newPeers = menuSyncPeers.filter(pid => 
-            pid !== peerId && 
-            !connections.current.has(pid)
-          );
-          
-          newPeers.forEach(newPeerId => {
-            if (peerId < newPeerId) {
+          setAllPeers(menuSyncPeers);
+
+          menuSyncPeers.forEach(newPeerId => {
+            if (newPeerId !== peerId && !connections.current.has(newPeerId)) {
               console.log(`Initiating connection to peer: ${newPeerId}`);
               const conn = peer.current?.connect(newPeerId);
-              if (conn) setupConnection(conn);
+              if (conn) setupConnection(conn, 'outgoing');
             }
           });
         });
       }, 5000);
 
       latencyInterval.current = setInterval(() => {
-        connections.current.forEach(conn => {
+        connections.current.forEach(({ conn }) => {
           const start = Date.now();
           conn.send({ type: 'ping', time: start });
         });
@@ -312,7 +348,7 @@ function App() {
       }
       
       console.log('Accepting connection from: ' + conn.peer);
-      setupConnection(conn);
+      setupConnection(conn, 'incoming');
     });
 
     const updateAnimation = () => {
@@ -394,13 +430,18 @@ function App() {
       for (const connectedPeerId of connectedPeers) {
         const isStillRegistered = await checkPeerRegistration(connectedPeerId);
         if (!isStillRegistered) {
-          const conn = connections.current.get(connectedPeerId);
-          if (conn) {
+          const connInfo = connections.current.get(connectedPeerId);
+          if (connInfo) {
             console.log(`Disconnecting from unregistered peer: ${connectedPeerId}`);
-            conn.close();
+            connInfo.conn.close();
             connections.current.delete(connectedPeerId);
-            setPeerCount(connections.current.size);
-            setPeerLatencies(prev => prev.filter(p => p.id !== connectedPeerId));
+            setPeerCount(prev => connections.current.size);
+            const now = Date.now();
+            setPeerLatencies(prev => prev.map(p => 
+              p.id === connectedPeerId 
+                ? { ...p, disconnected: true, disconnectTime: now }
+                : p
+            ));
           }
         }
       }
@@ -412,8 +453,18 @@ function App() {
   useEffect(() => {
     const cleanup = setInterval(() => {
       const now = Date.now();
-      setPeerLatencies(prev => prev.filter(p => now - p.lastUpdate < 10000));
-    }, 5000);
+      setPeerLatencies(prev => {
+        const newLatencies = prev.filter(p => {
+          if (p.disconnected) {
+            return p.disconnectTime && (now - p.disconnectTime) < PEER_DISCONNECT_LINGER;
+          }
+          const conn = connections.current.get(p.id);
+          return conn && now - p.lastUpdate < 10000;
+        });
+        return newLatencies;
+      });
+      updatePeerCount();
+    }, 1000);
 
     return () => clearInterval(cleanup);
   }, []);
@@ -431,7 +482,7 @@ function App() {
       }}
     >
       {showStatusBox && (
-        <div className="fixed top-4 left-4 bg-black/75 text-white p-4 rounded-lg font-sans" style={{ width: '500px', zIndex: 1000 }}>
+        <div className="fixed top-4 left-4 bg-black/80 text-white p-4 rounded-lg font-sans" style={{ width: '500px', zIndex: 1000 }}>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Clock size={16} />
@@ -455,24 +506,46 @@ function App() {
                 <span>Connected Peers: {peerCount}/{totalPeers}</span>
               </div>
               
-              {peerLatencies.length > 0 && (
+              {allPeers.length > 0 && (
                 <div className="bg-black/20 rounded p-2">
                   <table className="w-full text-sm">
                     <thead>
                       <tr>
                         <th className="text-left">Peer</th>
+                        <th className="text-center">Type</th>
                         <th className="text-right">Latency</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {peerLatencies.map(peer => (
-                        <tr key={peer.id}>
-                          <td className="pr-2">
-                            <PeerChip peerId={peer.id} />
-                          </td>
-                          <td className="text-right whitespace-nowrap">{peer.latency}ms</td>
-                        </tr>
-                      ))}
+                      {allPeers.map(pid => {
+                        if (pid === peerId) return null; // Don't show self
+                        const peerInfo = peerLatencies.find(p => p.id === pid);
+                        return (
+                          <tr key={pid} className={peerInfo?.disconnected ? 'opacity-50' : ''}>
+                            <td className="pr-2">
+                              <span className={peerInfo?.disconnected ? 'line-through' : ''}>
+                                <PeerChip peerId={pid} />
+                              </span>
+                            </td>
+                            <td className="text-center">
+                              {peerInfo ? (
+                                peerInfo.direction === 'incoming' ? (
+                                  <ArrowDownLeft size={14} className="inline text-green-400" />
+                                ) : (
+                                  <ArrowUpRight size={14} className="inline text-blue-400" />
+                                )
+                              ) : (
+                                <span className="text-gray-400">-</span>
+                              )}
+                            </td>
+                            <td className="text-right whitespace-nowrap">
+                              <span className={peerInfo?.disconnected ? 'line-through' : ''}>
+                                {peerInfo ? `${peerInfo.latency}ms` : '-'}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -495,7 +568,7 @@ function App() {
                 <div className="text-sm opacity-80">
                   <div>
                     From: {lastTimingUpdate.peerId === peerId ? 'Self' : (
-                      <PeerChip peerId={lastTimingUpdate.peerId} />
+                      lastTimingUpdate.peerId ? <PeerChip peerId={lastTimingUpdate.peerId} /> : 'Unknown'
                     )}
                   </div>
                   <div>Time: {new Date(lastTimingUpdate.timestamp).toISOString().substr(11, 23)}</div>
@@ -533,26 +606,22 @@ function App() {
       )}
 
       <div className="relative h-full">
-        {showImage && (
-          <div 
-            className="absolute inset-0 transition-transform duration-400 ease-in-out"
-            style={{
-              transform: slideDirection === 'vertical' 
-                ? `translateY(${slidePosition === 'left' ? '100%' : '0'})` 
-                : 'none'
-            }}
-          >
-            <img 
-              src="https://storage.googleapis.com/entwined-api-screenshots/f0a0a33f-4ad5-45c6-bbce-353c5a1c0c41.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=entwined-api-cloud-run-prod%40entwined-api.iam.gserviceaccount.com%2F20250208%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20250208T140221Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=07eebfc590bb8593a67eb19dc8ee262dd33078a9a5acf03a622b7fcdaec4d570078915dabc9cdc6251e591e2ce90fefe3622676bce056a3ee1479920526a162809b44a5f01d323b44478ae8703937ea34c62901c9bf1344fbae946896adc23f8ac3a9edf3dd246c90e15ed9f0c259010fc2e91feb66e0d900c769df013a764ddf28efcb3279d65bddc34aa2559713961fb5cc9d567e06ec2decfbca99461f22c896f87a7982fde7f7bebd0e7646fb51ec539cb73b300653279fab35d426d5db780d842cba1d106907664cd4ecca9c87e2489397fa11ab5c554c7ea50071519f16990874874077ab1cca6fec102d66d38553cf24e880aa3c9ba89bcc9710aef60"
-              alt="Display Image"
-              style={{
-                width: '7680px',
-                height: '1080px',
-                objectFit: 'none'
-              }}
-            />
-          </div>
-        )}
+        <img 
+          ref={imageRef}
+          src="https://storage.googleapis.com/entwined-api-screenshots/f0a0a33f-4ad5-45c6-bbce-353c5a1c0c41.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=entwined-api-cloud-run-prod%40entwined-api.iam.gserviceaccount.com%2F20250208%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20250208T140221Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=07eebfc590bb8593a67eb19dc8ee262dd33078a9a5acf03a622b7fcdaec4d570078915dabc9cdc6251e591e2ce90fefe3622676bce056a3ee1479920526a162809b44a5f01d323b44478ae8703937ea34c62901c9bf1344fbae946896adc23f8ac3a9edf3dd246c90e15ed9f0c259010fc2e91feb66e0d900c769df013a764ddf28efcb3279d65bddc34aa2559713961fb5cc9d567e06ec2decfbca99461f22c896f87a7982fde7f7bebd0e7646fb51ec539cb73b300653279fab35d426d5db780d842cba1d106907664cd4ecca9c87e2489397fa11ab5c554c7ea50071519f16990874874077ab1cca6fec102d66d38553cf24e880aa3c9ba89bcc9710aef60"
+          alt="Display Image"
+          style={{
+            width: '7680px',
+            height: '1080px',
+            objectFit: 'none',
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            opacity: showImage ? 1 : 0,
+            transition: 'opacity 0.4s ease-in-out',
+            pointerEvents: 'none'
+          }}
+        />
 
         {showColumns && (
           <div 
